@@ -1,0 +1,25 @@
+{
+  "name": "azfunctions-le",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AsherFoster/AzFunctions-LE.git"
+  },
+  "author": "Asher Foster <me@asherfoster.com>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/AsherFoster/AzFunctions-LE/issues"
+  },
+  "homepage": "https://github.com/AsherFoster/AzFunctions-LE#readme",
+  "dependencies": {
+    "azure-arm-website": "^5.3.0",
+    "cloudflare": "^2.4.1",
+    "ms-rest-azure": "^2.5.9",
+    "psl": "^1.1.29"
+  }
+}
