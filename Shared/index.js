@@ -1,95 +1,123 @@
 // Sections adapted from https://git.coolaj86.com/coolaj86/le-challenge-dns.js
 
-const AzWebsiteClient = require('azure-arm-website');
-const azureRest = require('ms-rest-azure');
-const config = require('../config.json');
 const tls = require('tls');
 const crypto = require('crypto');
 const {promisify} = require('util');
-const Cloudflare = require('cloudflare');
-const psl = require('psl');
 const LE = require('greenlock');
-const dns = require('dns');
+const azureRest = require('ms-rest-azure');
+const AzWebsiteClient = require('azure-arm-website');
+const {create: createPfx} = require('@jmshal/pfx');
+const config = require('../config.json');
+const CfChallenge = require('./challenge');
+const StorageStore = require('./store');
 
 const production = process.env.NODE_ENV === 'production';
-const acmePrefix = '_acme-challenge';
 
-class Renewerer {
-  // context = null;
-  // websiteClient = null;
-  // app = null;
-  // cf = null;
-  // appName = '';
-  // resourceGroup = '';
 
-  static async renew(context, appName, resourceGroup=config.resourceGroup) {
-    return new this(context, appName, resourceGroup);
-  }
+async function run(context, appName, resourceGroup = config.resourceGroup) {
+  // Get webapp
+  const creds = await azureRest.loginWithServicePrincipalSecret(config.clientId, config.secret, config.domain);
+  let websiteClient = new AzWebsiteClient(creds, config.subscriptionId);
 
-  constructor(context, appName, resourceGroup) {
-    this.context = context;
-    this.appName = appName;
-    this.resourceGroup = resourceGroup;
+  let app = await websiteClient.webApps.get(resourceGroup, appName);
+  if (!app) throw new Error(`Failed to get web app "${appName}" in resource group "${resourceGroup}"`);
+  context.log(`Retrieved app "${appName}", with hostnames ${app.enabledHostNames}`);
 
-    this._setup().then(() => this.run());
-  }
+  // Get hostnames
+  const hostnames = await getHostnamesToRenew(context, app.enabledHostNames); // TODO try here
+  if(!hostnames.length) throw new Error('No hostnames were ready to be renewed!');
 
-  // Setup the instance (Define websiteClient and cf)
-  async _setup() {
-    // Login to Azure AD
-    const creds = await azureRest.loginWithServicePrincipalSecret(config.clientId, config.secret, config.domain);
-    this.websiteClient = new AzWebsiteClient(creds, config.subscriptionId);
+  // Get cert
+  context.log(`Initialising certbot in ${production ? 'production' : 'development'} mode...`);
+  const store = await StorageStore.create({
+    storage: config.storage,
+    context,
+    configBlobName: `greenlock-${production ? 'prod' : 'dev'}.json`});
+  const cfChallenge = CfChallenge.create({context, cloudflare: config.cloudflare});
+  let le = LE.create({
+    // debug: true,
+    store,
+    version: 'v02',
+    server: production ?
+      'https://acme-v02.api.letsencrypt.org/directory' :
+      'https://acme-staging-v02.api.letsencrypt.org/directory',
+    challenges: {'dns-01': cfChallenge},
+    challengeType: 'dns-01'
+  });
 
-    // Create cloudflare client
-    const cf = Cloudflare(config.cloudflare);
-    if(!await cf.user.read()) {
-      throw new Error('Failed to authenticate with cloudflare!');
-    }
-    this.cf = cf;
+  context.log(`Creating cert with domains: ${hostnames}`);
+  let cert = await le.register({
+    domains: hostnames,
+    email: config.le.email,
+    agreeTos: true,
+    rsaKeySize: 2048,
+    challengeType: 'dns-01'
+  });
 
-    // Get the CF zones
-    const cfZoneList = (await cf.zones.browse()).result;
-    this.cfZones = {};
-    cfZoneList.forEach(z => this.cfZones[z.name] = z);
-  }
+  context.log(`Successfully created cert!`);
+  context.log(cert.identifiers);
 
-  // Main function
-  async run() {
-    // Get the app
-    this.app = await this.websiteClient.webApps.get(this.resourceGroup, this.appName);
-    if (!this.app) throw new Error(`Failed to get web app "${this.appName}" in resouce group "${this.resourceGroup}"`);
-    this.context.log(`Retrieved app "${this.appName}", with hostnames ${this.app.enabledHostNames}`);
+  // Convert to PFX
+  const pfxPass = (await promisify(crypto.randomBytes)(20)).toString('hex'); // Generates a 40 character long string
+  const pfxBuf = await createPfx({
+    cert: cert.cert,
+    privateKey: cert.privkey,
+    password: pfxPass
+  });
+  const thumbprint = (await execWithInput('openssl', ['x509', '-noout', '-fingerprint'], cert.cert))
+    .split('=')[1]
+    .replace(/:/g, '')
+    .slice(0, -1); // Why does this function even exist
+  // require('fs').writeFile('/Users/asher/Desktop/FunctionPfx.pfx', pfxBuf);
 
-    // Get domains that are old enough to renew
-    const hostnamesToRenew = await this.getHostnamesToRenew();
+  // Upload to webapp
+  const name = app.defaultHostName + '-' + thumbprint;
 
-    // Check all hostnames match a zone
-    hostnamesToRenew.forEach(hostname => {
-      const {domain} = psl.parse(hostname);
-      if(!this.cfZones[domain]) throw new Error(`Couldn't find a Cloudflare zone for hostname ${hostname} (Domain: ${domain})`);
+  context.log(`Uploading Certificate ${name}`);
+  try {
+    const resp = await websiteClient.certificates.createOrUpdate(resourceGroup, name, {
+      pfxBlob: pfxBuf,
+      serverFarmId: app.serverFarmId,
+      location: app.location,
+      password: pfxPass
     });
-
-    // Generate a certificate for given hostnames
-    const cert = await this.getCertificate(hostnamesToRenew);
-    this.context.log(`Successfully issued cert for ${cert.subject} (${cert.altnames}). Valid until ${cert.expiresAt}`);
-
-    // Convert cert to PFX
-    // Upload the certificate
-    // Bind the certificate
+    context.log(resp.id);
+  } catch(e) {
+    context.log(e);
   }
 
-  // Retrieves a list of hostnames that need renewing from given app.
-  async getHostnamesToRenew() {
-    let toRenew = [];
-    let hostnames = this.app.enabledHostNames.filter(h => !h.endsWith('azurewebsites.net'));
-    await Promise.all(hostnames.map(hostname => new Promise((resolve, reject) => {
+  // Bind to webapp
+  if(production) {
+    // Update each hostname binding
+    app.hostNameSslStates.forEach(sslState => {
+      context.log(`${sslState.name} is in SSLState ${sslState.sslState}`);
+      if(hostnames.includes(sslState.name)) {
+        sslState.sslState = 'SniEnabled';
+        sslState.thumbprint = thumbprint;
+        sslState.toUpdate = true;
+      }
+    });
+    // Save the changes
+    await websiteClient.webApps.beginCreateOrUpdate(resourceGroup, app.name, app);
+  } else { // Or delete, if in dev
+    await websiteClient.certificates.deleteMethod(resourceGroup, name);
+    context.log('Certificate successfully generated, uploaded, and removed! Dry run complete!');
+  }
+}
+
+async function getHostnamesToRenew(context, hostnames) {
+  let toRenew = [];
+  hostnames = hostnames.filter(h => !h.endsWith('azurewebsites.net')); // Ignore Azure owned domains
+
+  await Promise.all(hostnames.map(hostname => new Promise((resolve, reject) => {
+    try {
       let socket = tls.connect(443, hostname, null, () => {
         const issuedAt = new Date(socket.getPeerCertificate().valid_from);
         const age = (new Date() - issuedAt) / (1000 * 60 * 60); // Age in hours
         if(age < (24 * 7)) { // If it's less than a week old
-          this.context.log(`IGNORING ${hostname}: ${age} hours old`);
+          context.log(`IGNORING ${hostname}: ${age} hours old`);
         } else {
-          this.context.log(`RENEWING ${hostname}: ${age} hours old`);
+          context.log(`RENEWING ${hostname}: ${age} hours old`);
           toRenew.push(hostname);
         }
         socket.end();
@@ -103,112 +131,32 @@ class Renewerer {
           reject(e);
         }
       });
-    })));
-  
-    return toRenew;
-  }
-
-  // Orchestrates issuing cert
-  async getCertificate(hostnames) {
-    let le = LE.create({
-      version: 'v02',
-      server: production ?
-        'https://acme-v02.api.letsencrypt.org/directory' :
-        'https://acme-staging-v02.api.letsencrypt.org/directory',
-      challenges: {'dns-01': {set: this.challenge}},
-      challengeType: 'dns-01'
-    });
-
-    let hasCerts = le.check({domains: hostnames});
-    if(hasCerts) throw new Error(`Already have certs? ${hasCerts}`); // TODO figure this case out. What does it even mean
-
-    return le.register({
-      domains: hostnames,
-      email: config.le.email,
-      agreeTos: true,
-      rsaKeySize: 2048
-    });
-  }
-
-  // Orchestrate completing challenge
-  async challenge(args, domain, challenge, keyAuthorization, cb) {
-    const keyAuthDigest = crypto.createHash('sha256').update(keyAuthorization||'').digest('base64')
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=+$/g, '');
-    
-    await this.setCloudflareRecords(domain, keyAuthDigest);
-    cb();
-  }
-
-  // Set the CF TXT records
-  async setCloudflareRecords(domain, authContent) {
-    // Set the CF attributes
-    const challengeDomain = acmePrefix + '.' + domain;
-    const zone = this.cfZones[domain];
-    const records = await this.getTxtRecords(zone, challengeDomain);
-    let record;
-    switch (records.length) {
-      default:
-        this.context.log(`Removing ${records.length - 1} existing verification records, leaving one to edit`);
-        await Promise.all(records.slice(1).map(r => this.cf.dnsRecords.del(zone.id, r.id)));
-      // noinspection FallThroughInSwitchStatementJS
-      case 1:
-        this.context.log(`Updating existing TXT record for '${challengeDomain}' with '${authContent}'.`);
-        record = await this.cf.dnsRecords.edit(
-          zone.id,
-          records[0].id,
-          Object.assign({}, records[0], { content: authContent, ttl: 120 })
-        );
-        break;
-      case 0:
-        this.context.log(`Found no TXT records for '${challengeDomain}'. Creating a new one with '${authContent}'`);
-        record = await this.cf.dnsRecords.add(zone.id, {
-          type: 'TXT',
-          name: challengeDomain,
-          content: authContent,
-          ttl: 120
-        });
-      }
-    await this.verifyPropagation(challengeDomain, authContent);
-    return record.result;
-  }
-
-  // Delays until the correct records are being resolved
-  async verifyPropagation(domain, challengeContent, attempts = 10) {
-    this.context.log(`Awaiting propagation of TXT record for '${domain}'.`);
-    for (let i = 0; i <= attempts; i++) {
-      try {
-        if(await this.checkTxtRecord(domain, challengeContent))
-          return this.context.log(`Successfully propagated challenge for '${domain}'.`);
-      } catch (error) {
-        this.context.warn(`Try ${i + 1}. Awaiting propagation for ${domain}.`);
-        await delay(2000);
-      }
+    } catch (e) {
+      // Failed to connect for some reason, let's try giving it a new cert.
+      if(!toRenew.includes(hostname))
+        toRenew.push(hostname);
+      resolve();
     }
-    throw new Error(`Could not verify challenge for '${domain}'.`);
-  }
+  })));
 
-  // Checks that there is a TXT record at the domain that matches value
-  async checkTxtRecord(domain, value) {
-    const records = await util.promisify(dns.resolveTxt(domain));
-    return records.some(r => r.join() === value);
-  }
-
-  // Lists TXT records for a domain via CF
-  async getTxtRecords(zone, name) {
-    let records = (await this.cf.dnsRecords.browse(zone.id, {type: 'TXT'})).result;
-    this.context.log(`Got ${records.length} TXT records for ${name}, ${records.map(r => r.name + ' -- ' + r.value)}`);
-    records = records.filter(r => r.name === name);
-
-    return records;
-  }
+  return toRenew;
 }
 
-function delay(ms) {
-  return new Promise(r => {
-    setTimeout(() => r(), ms)
+function execWithInput(command, args, input) {
+  return new Promise((resolve, reject) => {
+    const proc = require('child_process').spawn(command, args);
+    let output = '';
+    proc.stdout.setEncoding('utf8');
+    proc.stdout.on('data', chunk => {
+      output += chunk;
+      if (chunk.endsWith('\n')) {
+        proc.stdin.end();
+        return resolve(output);
+      }
+    });
+    proc.stdin.write(input);
   })
 }
 
-module.exports = Renewerer;
+
+module.exports = run;

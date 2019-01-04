@@ -1,13 +1,13 @@
-const Renewer = require('../Shared');
+const renew = require('../Shared/index');
 
 module.exports = async function (context, myTimer) {
-    const startTime = new Date().toISOString();
-    
-    if(myTimer.isPastDue) {
-        context.log('JavaScript is running late!');
-    }
+  const startTime = new Date().toISOString();
 
-    await Renewer.renew(context, 'AFApis');
+  if(myTimer.isPastDue) {
+    context.log('JavaScript is running late!');
+  }
 
-    context.log('JavaScript timer trigger function ran!', startTime);
+  await renew(context, 'AFApis');
+
+  context.log('JavaScript timer trigger function ran!', startTime);
 };

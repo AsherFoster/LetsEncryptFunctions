@@ -17,9 +17,11 @@
   },
   "homepage": "https://github.com/AsherFoster/AzFunctions-LE#readme",
   "dependencies": {
+    "@azure/storage-blob": "^10.1.0-preview",
+    "@jmshal/pfx": "^0.1.0",
     "azure-arm-website": "^5.3.0",
     "cloudflare": "^2.4.1",
-    "ms-rest-azure": "^2.5.9",
-    "psl": "^1.1.29"
+    "greenlock": "^2.4.2",
+    "ms-rest-azure": "^2.5.9"
   }
 }
