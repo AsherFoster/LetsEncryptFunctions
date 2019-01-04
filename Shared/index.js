@@ -24,7 +24,7 @@ async function run(context, appName, resourceGroup = config.resourceGroup) {
   context.log(`Retrieved app "${appName}", with hostnames ${app.enabledHostNames}`);
 
   // Get hostnames
-  const hostnames = await getHostnamesToRenew(context, app.enabledHostNames); // TODO try here
+  const hostnames = app.enabledHostNames.filter(h => !h.endsWith('azurewebsites.net')); // Ignore Azure owned domains
   if(!hostnames.length) throw new Error('No hostnames were ready to be renewed!');
 
   // Get cert
@@ -105,42 +105,6 @@ async function run(context, appName, resourceGroup = config.resourceGroup) {
   }
 }
 
-async function getHostnamesToRenew(context, hostnames) {
-  let toRenew = [];
-  hostnames = hostnames.filter(h => !h.endsWith('azurewebsites.net')); // Ignore Azure owned domains
-
-  await Promise.all(hostnames.map(hostname => new Promise((resolve, reject) => {
-    try {
-      let socket = tls.connect(443, hostname, null, () => {
-        const issuedAt = new Date(socket.getPeerCertificate().valid_from);
-        const age = (new Date() - issuedAt) / (1000 * 60 * 60); // Age in hours
-        if(age < (24 * 7)) { // If it's less than a week old
-          context.log(`IGNORING ${hostname}: ${age} hours old`);
-        } else {
-          context.log(`RENEWING ${hostname}: ${age} hours old`);
-          toRenew.push(hostname);
-        }
-        socket.end();
-        resolve();
-      });
-      socket.on('error', e => {
-        if(e.code === 'ERR_TLS_CERT_ALTNAME_INVALID') { // Doesn't have a valid cert, setup first one
-          toRenew.push(hostname);
-          resolve();
-        } else {
-          reject(e);
-        }
-      });
-    } catch (e) {
-      // Failed to connect for some reason, let's try giving it a new cert.
-      if(!toRenew.includes(hostname))
-        toRenew.push(hostname);
-      resolve();
-    }
-  })));
-
-  return toRenew;
-}
 
 function execWithInput(command, args, input) {
   return new Promise((resolve, reject) => {
