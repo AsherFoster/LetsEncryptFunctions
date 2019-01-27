@@ -284,7 +284,7 @@ module.exports.create = async function create(options) {
       let index;
       let accountId;
       let account;
-      context.log(certs);
+      // context.log(certs);
       const subject = certs.subject || opts.domains[0];
       const altnames = certs.altnames || opts.domains;
       let accountCerts;

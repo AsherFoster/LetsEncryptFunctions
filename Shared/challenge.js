@@ -85,7 +85,7 @@ module.exports = class CloudflareChallenge {
     context.log('Creating new CloudflareChallenge instance:', {
       acmePrefix,
       verifyPropagation,
-      cloudflare
+      cloudflare: cloudflare.email
     });
 
     this.context = context;
@@ -221,9 +221,7 @@ module.exports = class CloudflareChallenge {
   ) {
     try {
       const fqdn = CloudflareChallenge.getFQDN(domain, acmePrefix);
-      context.log(
-        `Testing TXT record existence for '${fqdn}' using native DNS.`
-      );
+      context.log(`Testing TXT record existence for '${fqdn}' using native DNS.`);
 
       const records = await resolveTxt(fqdn);
 
