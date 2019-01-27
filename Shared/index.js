@@ -17,7 +17,10 @@ const LEServer = production ?
 
 async function run(context, appName, resourceGroup = config.resourceGroup) {
   context.log(`Starting renewal! Node ${process.version}`);
-  // Get webapp
+
+  // *********************
+  // Get webapp and info
+  // *********************
   const creds = await azureRest.loginWithServicePrincipalSecret(config.clientId, config.secret, config.domain);
   let websiteClient = new AzWebsiteClient(creds, config.subscriptionId);
 
@@ -25,16 +28,20 @@ async function run(context, appName, resourceGroup = config.resourceGroup) {
   if (!app) throw new Error(`Failed to get web app "${appName}" in resource group "${resourceGroup}"`);
   context.log(`Retrieved app "${appName}", with hostnames ${app.enabledHostNames}`);
 
-  // Get hostnames
   const hostnames = app.enabledHostNames.filter(h => !h.endsWith('azurewebsites.net')); // Ignore Azure owned domains
   if(!hostnames.length) throw new Error('No hostnames were ready to be renewed!');
 
-  // Get cert
-  context.log(`Initialising certbot in ${production ? 'production' : 'development'} mode, using ${LEServer}...`);
+
+  // *********************
+  // Create cert
+  // *********************
+  config.storage.configBlobName = config.storage[production ? 'prodConfigBlobName' : 'devConfigBlobName'] || config.storage.configBlobName || null;
+  context.log(`Initialising certbot in ${production ? 'production' : 'development'} mode...`);
+  context.log(`Config file: ${config.storage.configBlobName} in ${config.storage.container}, ACME server: ${LEServer}`);
   const store = await StorageStore.create({
     storage: config.storage,
-    context,
-    configBlobName: `greenlock-${production ? 'prod' : 'dev'}.json`});
+    context
+  });
 
   if(config.dnsServers) require('dns').setServers(config.dnsServers);
 
@@ -63,7 +70,10 @@ async function run(context, appName, resourceGroup = config.resourceGroup) {
   context.log(`Successfully created cert!`);
   context.log(cert.identifiers);
 
+
+  // *********************
   // Convert to PFX
+  // *********************
   context.log('Generating PFX...');
   const pfxPass = (await promisify(crypto.randomBytes)(20)).toString('hex'); // Generates a 40 character long string
   const pfxBuf = await generatePfx({
@@ -73,45 +83,51 @@ async function run(context, appName, resourceGroup = config.resourceGroup) {
     password: pfxPass
   });
   const thumbprint = await getCertFingerprint(cert.cert);
-  // require('fs').writeFile('/Users/asher/Desktop/FunctionPfx.pfx', pfxBuf);
 
+
+  // *********************
   // Upload to webapp
-  const name = app.defaultHostName + '-' + thumbprint + '-' + Date.now();
+  // *********************
+  const name = (production ? 'prod-' : 'dev-') + app.defaultHostName + '-' + thumbprint;
 
   context.log(`Uploading Certificate ${name}`);
-  const existingCert = await websiteClient.certificates.get(resourceGroup, name);
-  context.log(existingCert);
-  if (existingCert)
-    context.log(`Found existing cert ${existingCert.friendlyName}`);
-  else
-    context.log('No existing cert found, creating new one');
+  let existingCert;
+  try {
+    existingCert = await websiteClient.certificates.get(resourceGroup, name);
+    context.log(existingCert);
+  } catch(e) { }
 
-  let certEnvelope;
   if (existingCert) {
+    context.log(`Found existing cert ${existingCert.friendlyName}`);
     existingCert.expirationDate = cert.expiresAt;
     existingCert.issueDate = cert.issuedAt;
     existingCert.cerBlob = cert.cert;
     existingCert.pfxBlob = pfxBuf;
     existingCert.password = pfxPass;
     existingCert.thumbprint = thumbprint;
-    certEnvelope = existingCert;
-  } else {
-    certEnvelope = {
-      pfxBlob: pfxBuf,
-      serverFarmId: app.serverFarmId,
-      thumbprint: thumbprint,
-      location: app.location,
-      password: pfxPass
-    };
-  }
-  try {
-    const resp = await websiteClient.certificates.createOrUpdate(resourceGroup, name, certEnvelope);
+    const resp = await websiteClient.certificates.update(resourceGroup, name, existingCert);
     context.log(resp.id);
-  } catch(e) {
-    context.log(e);
+   } else {
+    context.log('No existing cert found, creating new one');
+    try {
+      var resp = await websiteClient.certificates.createOrUpdate(resourceGroup, name, {
+        pfxBlob: pfxBuf,
+        serverFarmId: app.serverFarmId,
+        location: app.location,
+        password: pfxPass
+      });
+    } catch(e) {
+      context.log('Failed to upload certificate!');
+      context.log(e.response.body.message);
+      throw e;
+    }
+    context.log(resp.id);
   }
 
+
+  // *********************
   // Bind to webapp
+  // *********************
   if(production) {
     // Update each hostname binding
     app.hostNameSslStates.forEach(sslState => {
@@ -129,9 +145,5 @@ async function run(context, appName, resourceGroup = config.resourceGroup) {
     context.log('Certificate successfully generated, uploaded, and removed! Dry run complete!');
   }
 }
-
-
-
-
 
 module.exports = run;
