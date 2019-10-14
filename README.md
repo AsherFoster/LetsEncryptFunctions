@@ -1,4 +1,6 @@
-# Lets Encrypt Functions
+# [Deprecated] Lets Encrypt Functions
+**This is definitely not maintained, and may not be compatible with newer APIs. Use with caution**
+
 A library I made to renew [Azure Web App](https://azure.microsoft.com/en-us/services/app-service/web/)
 certificates using [Let's Encrypt](https://letsencrypt.org/), designed to be run on [Azure Functions](https://azure.microsoft.com/en-us/services/functions/).
 Uses cloudflare for challenges
